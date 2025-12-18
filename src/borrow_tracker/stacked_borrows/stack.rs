@@ -1,7 +1,7 @@
 #[cfg(feature = "stack-cache")]
 use std::ops::Range;
 
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_log::tracing::trace;
 
 use crate::borrow_tracker::stacked_borrows::{Item, Permission};
@@ -19,6 +19,18 @@ const CACHE_LEN: usize = 32;
 /// Extra per-location state.
 #[derive(Clone, Debug)]
 pub struct Stack {
+    /// Lower bounds for the maximum number of sharedROs on the stack. This cannot be exact due to wildcard pointers
+    /// making `unknown_bottom` `Some(id)`.
+    max_sharedro: FxHashMap<BorTag, u32>,
+
+    /// Lower bounds for the maximum number of sharedRWs on the stack. This cannot be exact due to wildcard pointers
+    /// making `unknown_bottom` `Some(id)`.
+    max_sharedrw: FxHashMap<BorTag, u32>,
+
+    /// Lower bounds for the maximum number of sharedROs on the stack. This cannot be exact due to wildcard pointers
+    /// making `unknown_bottom` `Some(id)`.
+    max_unique: FxHashMap<BorTag, u32>,
+
     /// Used *mostly* as a stack; never empty.
     /// Invariants:
     /// * Above a `SharedReadOnly` there can only be more `SharedReadOnly`.
@@ -142,6 +154,9 @@ impl PartialEq for Stack {
                 cache: _,
             #[cfg(feature = "stack-cache")]
                 unique_range: _,
+            max_sharedro: _,
+            max_sharedrw: _,
+            max_unique: _,
         } = self;
         *borrows == other.borrows && *unknown_bottom == other.unknown_bottom
     }
@@ -295,6 +310,31 @@ impl<'tcx> Stack {
     pub fn insert(&mut self, new_idx: usize, new: Item) {
         self.borrows.insert(new_idx, new);
 
+        // Inserting into borrows might mean the max changed, so we update the curret sets. This is stupidly
+        // ineffecient, but also hopefully it doesn't matter.
+        let mut uniques: FxHashMap<BorTag, u32> = FxHashMap::default();
+        let mut sharedros: FxHashMap<BorTag, u32> = FxHashMap::default();
+        let mut sharedrws: FxHashMap<BorTag, u32> = FxHashMap::default();
+        for b in &self.borrows {
+            match b.perm() {
+                Permission::Unique => *uniques.entry(b.tag()).or_default() += 1,
+                Permission::SharedReadWrite => *sharedros.entry(b.tag()).or_default() += 1,
+                Permission::SharedReadOnly => *sharedrws.entry(b.tag()).or_default() += 1,
+                Permission::Disabled => {}
+            }
+        }
+
+        let update_self = |new: FxHashMap<BorTag, u32>, old: &mut FxHashMap<BorTag, u32>| {
+            for (k, v) in new {
+                old.entry(k).or_default();
+                old.entry(k).and_modify(|e| *e = (*e).max(v));
+            }
+        };
+
+        update_self(uniques, &mut self.max_unique);
+        update_self(sharedros, &mut self.max_sharedro);
+        update_self(sharedrws, &mut self.max_sharedrw);
+
         #[cfg(feature = "stack-cache")]
         self.insert_cache(new_idx, new);
     }
@@ -347,6 +387,9 @@ impl<'tcx> Stack {
             cache: StackCache { idx: [0; CACHE_LEN], items: [item; CACHE_LEN] },
             #[cfg(feature = "stack-cache")]
             unique_range: if item.perm() == Permission::Unique { 0..1 } else { 0..0 },
+            max_sharedro: FxHashMap::default(),
+            max_sharedrw: FxHashMap::default(),
+            max_unique: FxHashMap::default(),
         }
     }
 
