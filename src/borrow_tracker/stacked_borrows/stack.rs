@@ -1,6 +1,7 @@
 #[cfg(feature = "stack-cache")]
 use std::ops::Range;
 
+use rustc_const_eval::interpret::AllocId;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_log::tracing::trace;
 
@@ -19,6 +20,13 @@ const CACHE_LEN: usize = 32;
 /// Extra per-location state.
 #[derive(Clone, Debug)]
 pub struct Stack {
+    alloc: AllocId,
+    max_size: usize,
+    max_contig: usize,
+    max_contig_perm: Permission,
+
+    all: FxHashMap<BorTag, u32>,
+
     /// Lower bounds for the maximum number of sharedROs on the stack. This cannot be exact due to wildcard pointers
     /// making `unknown_bottom` `Some(id)`.
     max_sharedro: FxHashMap<BorTag, u32>,
@@ -157,6 +165,11 @@ impl PartialEq for Stack {
             max_sharedro: _,
             max_sharedrw: _,
             max_unique: _,
+            all: _,
+            max_size: _,
+            alloc: _,
+            max_contig: _,
+            max_contig_perm: _,
         } = self;
         *borrows == other.borrows && *unknown_bottom == other.unknown_bottom
     }
@@ -315,7 +328,9 @@ impl<'tcx> Stack {
         let mut uniques: FxHashMap<BorTag, u32> = FxHashMap::default();
         let mut sharedros: FxHashMap<BorTag, u32> = FxHashMap::default();
         let mut sharedrws: FxHashMap<BorTag, u32> = FxHashMap::default();
+        let mut all: FxHashMap<BorTag, u32> = FxHashMap::default();
         for b in &self.borrows {
+            *all.entry(b.tag()).or_default() += 1;
             match b.perm() {
                 Permission::Unique => *uniques.entry(b.tag()).or_default() += 1,
                 Permission::SharedReadWrite => *sharedros.entry(b.tag()).or_default() += 1,
@@ -324,16 +339,68 @@ impl<'tcx> Stack {
             }
         }
 
-        let update_self = |new: FxHashMap<BorTag, u32>, old: &mut FxHashMap<BorTag, u32>| {
-            for (k, v) in new {
-                old.entry(k).or_default();
-                old.entry(k).and_modify(|e| *e = (*e).max(v));
-            }
-        };
+        let update_self =
+            |new: FxHashMap<BorTag, u32>, old: &mut FxHashMap<BorTag, u32>, _name: &str| {
+                for (k, v) in new {
+                    let old_v = *old.entry(k).or_default();
+                    if old_v < v {
+                        old.insert(k, v);
+                        // if v != 1 {
+                        // println!("{}, tag {:?}: {}", name, k, v);
+                        //}
+                    }
+                }
+            };
 
-        update_self(uniques, &mut self.max_unique);
-        update_self(sharedros, &mut self.max_sharedro);
-        update_self(sharedrws, &mut self.max_sharedrw);
+        update_self(uniques, &mut self.max_unique, "uniques");
+        update_self(sharedros, &mut self.max_sharedro, "sharedros");
+        update_self(sharedrws, &mut self.max_sharedrw, "sharedrw");
+        update_self(all, &mut self.all, "all");
+
+        let mut cur_contig = 0;
+        let mut max_contig = 0;
+        let mut last = None;
+        let mut max_contig_perm = None;
+        for b in &self.borrows {
+            match last {
+                None => {
+                    last = Some(b.perm());
+                    cur_contig += 1;
+                }
+                Some(p) =>
+                    if p == b.perm() {
+                        cur_contig += 1;
+                    } else {
+                        cur_contig = 1;
+                        last = Some(b.perm());
+                        if max_contig < cur_contig {
+                            max_contig = cur_contig;
+                            max_contig_perm = Some(b.perm());
+                        }
+                    },
+            }
+        }
+        if max_contig < cur_contig {
+            max_contig = cur_contig;
+            max_contig_perm = last;
+        }
+
+        if self.max_contig < max_contig {
+            self.max_contig = max_contig;
+            self.max_contig_perm = max_contig_perm.unwrap();
+            println!(
+                "max stack size for alloc {:?}: {}:{:?}",
+                self.max_contig, max_contig, self.max_contig_perm
+            );
+            // for b in &self.borrows {
+            //     println!("{:?}, {:?}", b.tag(), b.perm());
+            // }
+        }
+
+        let cur_size = self.borrows.iter().filter(|x| x.perm() != Permission::Disabled).count();
+        if self.max_size < cur_size {
+            self.max_size = cur_size;
+        }
 
         #[cfg(feature = "stack-cache")]
         self.insert_cache(new_idx, new);
@@ -379,8 +446,9 @@ impl<'tcx> Stack {
     }
 
     /// Construct a new `Stack` using the passed `Item` as the root tag.
-    pub fn new(item: Item) -> Self {
+    pub fn new(item: Item, alloc: AllocId) -> Self {
         Stack {
+            alloc,
             borrows: vec![item],
             unknown_bottom: None,
             #[cfg(feature = "stack-cache")]
@@ -390,6 +458,10 @@ impl<'tcx> Stack {
             max_sharedro: FxHashMap::default(),
             max_sharedrw: FxHashMap::default(),
             max_unique: FxHashMap::default(),
+            all: FxHashMap::default(),
+            max_size: 0,
+            max_contig: 0,
+            max_contig_perm: Permission::Disabled,
         }
     }
 

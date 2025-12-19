@@ -466,7 +466,7 @@ impl<'tcx> Stacks {
         machine: &MiriMachine<'_>,
     ) -> Self {
         let item = Item::new(tag, perm, false);
-        let stack = Stack::new(item);
+        let stack = Stack::new(item, id);
 
         Stacks {
             stacks: DedupRangeMap::new(size, stack),
